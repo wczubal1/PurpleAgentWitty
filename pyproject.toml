@@ -1,0 +1,19 @@
+[project]
+name = "purple-agent-short-interest"
+version = "0.1.0"
+description = "A purple A2A agent that calls client_short.py for short interest data"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "a2a-sdk[http-server]>=0.3.20",
+    "openai>=1.40.0",
+    "pydantic>=2.12.5",
+    "uvicorn>=0.38.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.1",
+]
