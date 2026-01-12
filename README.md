@@ -11,6 +11,14 @@ uv sync
 uv run src/server.py --host 127.0.0.1 --port 9010
 ```
 
+## Make Targets
+
+```bash
+make run
+make docker-build
+make docker-run
+```
+
 ## LLM Configuration
 
 Set the OpenAI API key (required):

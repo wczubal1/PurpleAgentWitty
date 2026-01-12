@@ -1,6 +1,6 @@
 [project]
 name = "purple-agent-short-interest"
-version = "0.1.0"
+version = "1.0.0"
 description = "A purple A2A agent that calls client_short.py for short interest data"
 readme = "README.md"
 requires-python = ">=3.13"
