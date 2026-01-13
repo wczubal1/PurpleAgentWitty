@@ -68,7 +68,7 @@ If you publish this repo with GitHub Actions, add:
 ```json
 {
   "task": "max_short_interest",
-  "client_short_path": "/home/wczubal1/projects/tau2/brokercheck/client_short.py",
+  "client_short_path": "/opt/client_short.py",
   "requested_settlement_date": "2025-05-15",
   "min_attempts": 3,
   "args": {
@@ -80,6 +80,10 @@ If you publish this repo with GitHub Actions, add:
   "timeout": 60
 }
 ```
+
+Note: `client_short_path` must exist in the runtime. If you use Docker, mount the
+script into the container (e.g. `-v /path/to/client_short.py:/opt/client_short.py`)
+or bake it into a custom image.
 
 ## Response
 
