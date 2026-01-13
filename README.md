@@ -33,6 +33,15 @@ Optional model override (defaults to `gpt-4o-mini`):
 export OPENAI_MODEL="gpt-4o-mini"
 ```
 
+## FINRA Credentials
+
+FINRA credentials must be supplied at runtime (they are not bundled with the agent):
+
+```bash
+export FINRA_CLIENT_ID="..."
+export FINRA_CLIENT_SECRET="..."
+```
+
 ## Docker
 
 Build and run:
@@ -48,6 +57,8 @@ If you publish this repo with GitHub Actions, add:
 
 - `OPENAI_API_KEY` (required for runtime tool use)
 - `OPENAI_MODEL` (optional override)
+- `FINRA_CLIENT_ID` (required to call FINRA)
+- `FINRA_CLIENT_SECRET` (required to call FINRA)
 
 ## Expected Request (from green agent)
 

@@ -19,7 +19,10 @@ def main() -> None:
     skill = AgentSkill(
         id="short-interest-fetch",
         name="Short Interest Fetch",
-        description="Calls client_short.py and returns short interest JSON.",
+        description=(
+            "Calls client_short.py and returns short interest JSON. Requires "
+            "OPENAI_API_KEY and FINRA credentials supplied at runtime."
+        ),
         tags=["finra", "short-interest", "tool"],
         examples=[
             '{"task":"max_short_interest","client_short_path":"/home/wczubal1/projects/tau2/brokercheck/client_short.py","requested_settlement_date":"2025-05-15","min_attempts":3,"args":{"symbols":["TSLA","NVDA","AAPL"],"settlement_date":"2025-05-15"}}'
@@ -28,7 +31,10 @@ def main() -> None:
 
     agent_card = AgentCard(
         name="Short Interest Purple Agent",
-        description="Executes client_short.py and returns JSON artifacts.",
+        description=(
+            "Executes client_short.py and returns JSON artifacts. Requires "
+            "OPENAI_API_KEY and FINRA credentials supplied at runtime."
+        ),
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version="1.0.0",
         default_input_modes=["text"],
