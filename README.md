@@ -1,7 +1,7 @@
 # Purple Agent (Short Interest)
 
-This purple agent uses an LLM to decide how to call
-`/home/wczubal1/projects/tau2/brokercheck/client_short.py` for short interest data and
+This purple agent uses an LLM to decide how to call a `client_short.py` script
+(path provided at runtime, e.g. `/opt/client_short.py`) for short interest data and
 returns JSON in an A2A artifact.
 
 ## Run
