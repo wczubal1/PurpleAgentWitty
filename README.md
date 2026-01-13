@@ -33,6 +33,21 @@ Optional model override (defaults to `gpt-4o-mini`):
 export OPENAI_MODEL="gpt-4o-mini"
 ```
 
+## MCP Tool Server (Optional)
+
+The purple agent can call an MCP tool instead of running `client_short.py` directly.
+Set `MCP_SERVER_COMMAND` to enable it (the agent will spawn the server per call):
+
+```bash
+export MCP_SERVER_COMMAND="python src/mcp_server.py"
+```
+
+If `MCP_SERVER_COMMAND` is not set, the agent will call `client_short.py` directly.
+
+This MCP server exposes the tool:
+
+- `finra_short_interest(symbol, settlement_date, issue_name?, client_short_path?, finra_client_id?, finra_client_secret?, timeout?)`
+
 ## FINRA Credentials
 
 FINRA credentials must be supplied at runtime (they are not bundled with the agent):

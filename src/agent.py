@@ -1,11 +1,17 @@
 from typing import Any
 from datetime import date, datetime
+import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
+import threading
 
 from openai import OpenAI
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 from pydantic import BaseModel, ValidationError
 from a2a.server.tasks import TaskUpdater
@@ -220,6 +226,35 @@ def _tool_run_client_short(
     if symbols_allowed is not None and symbol not in symbols_allowed:
         return {"error": f"symbol {symbol} is not in the provided symbol list"}
 
+    mcp_command = os.environ.get("MCP_SERVER_COMMAND")
+    if mcp_command:
+        try:
+            mcp_payload = _run_mcp_short_interest(
+                command=mcp_command,
+                client_short_path=client_short_path,
+                finra_client_id=finra_client_id,
+                finra_client_secret=finra_client_secret,
+                timeout=timeout,
+                symbol=symbol,
+                settlement_date=settlement_date,
+                issue_name=issue_name,
+            )
+            if isinstance(mcp_payload, dict) and mcp_payload.get("error"):
+                return {
+                    "symbol": symbol,
+                    "settlement_date": settlement_date,
+                    "error": str(mcp_payload.get("error")),
+                }
+            if isinstance(mcp_payload, dict):
+                return mcp_payload
+            return {
+                "symbol": symbol,
+                "settlement_date": settlement_date,
+                "error": "Unexpected MCP response format",
+            }
+        except Exception as exc:
+            return {"symbol": symbol, "settlement_date": settlement_date, "error": str(exc)}
+
     try:
         payload = _run_client_short(
             client_short_path=client_short_path,
@@ -239,6 +274,82 @@ def _tool_run_client_short(
         }
     except Exception as exc:
         return {"symbol": symbol, "settlement_date": settlement_date, "error": str(exc)}
+
+
+def _run_mcp_short_interest(
+    *,
+    command: str,
+    client_short_path: str,
+    finra_client_id: str | None,
+    finra_client_secret: str | None,
+    timeout: int | None,
+    symbol: str,
+    settlement_date: str,
+    issue_name: str | None,
+) -> dict[str, Any]:
+    parts = shlex.split(command)
+    if not parts:
+        raise RuntimeError("MCP_SERVER_COMMAND is empty")
+    params = StdioServerParameters(command=parts[0], args=parts[1:])
+    tool_args = {
+        "symbol": symbol,
+        "settlement_date": settlement_date,
+        "issue_name": issue_name,
+        "client_short_path": client_short_path,
+        "finra_client_id": finra_client_id,
+        "finra_client_secret": finra_client_secret,
+        "timeout": timeout,
+    }
+    return _run_async(_call_mcp_tool(params, tool_args))
+
+
+async def _call_mcp_tool(
+    params: StdioServerParameters,
+    tool_args: dict[str, Any],
+) -> dict[str, Any]:
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("finra_short_interest", tool_args)
+            return _coerce_mcp_result(result)
+
+
+def _coerce_mcp_result(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    content = getattr(result, "content", None)
+    if isinstance(content, list) and content:
+        first = content[0]
+        text = getattr(first, "text", None)
+        if isinstance(text, str) and text.strip():
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"error": f"Invalid JSON from MCP: {text}"}
+    return {"error": "Unexpected MCP response"}
+
+
+def _run_async(coro: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result_container: dict[str, Any] = {}
+    error_container: dict[str, BaseException] = {}
+
+    def _runner() -> None:
+        try:
+            result_container["value"] = asyncio.run(coro)
+        except BaseException as exc:
+            error_container["error"] = exc
+
+    thread = threading.Thread(target=_runner)
+    thread.start()
+    thread.join()
+    if error_container:
+        raise error_container["error"]
+    return result_container.get("value")
 
 
 def _run_llm(
