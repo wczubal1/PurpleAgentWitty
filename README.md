@@ -42,6 +42,9 @@ export FINRA_CLIENT_ID="..."
 export FINRA_CLIENT_SECRET="..."
 ```
 
+Create your FINRA API credentials here:
+https://developer.finra.org/docs#getting_started-the_api_console
+
 ## Docker
 
 Build and run:
