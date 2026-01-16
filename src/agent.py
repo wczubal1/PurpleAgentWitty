@@ -21,7 +21,7 @@ from a2a.utils import get_message_text
 
 DEFAULT_CLIENT_SHORT_PATH = "/home/wczubal1/projects/tau2/brokercheck/client_short.py"
 MIN_ATTEMPTS = 3
-MAX_TOOL_ROUNDS = 8
+MAX_TOOL_ROUNDS = 20
 
 
 class PurpleRequest(BaseModel):
@@ -94,6 +94,39 @@ def _normalize_symbols(value: Any) -> list[str] | None:
     else:
         return None
     return symbols or None
+
+
+def _unwrap_response(payload: Any, task: str) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get(task)
+    if isinstance(nested, dict):
+        return nested
+    return payload
+
+
+def _missing_symbols(
+    payload: dict[str, Any],
+    symbols: list[str],
+    min_attempts: int,
+) -> list[str]:
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return [symbol.upper() for symbol in symbols]
+
+    seen: set[str] = set()
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or item.get("symbolCode") or "").strip().upper()
+        if not symbol:
+            continue
+        attempts = item.get("attempts")
+        attempts_len = len(attempts) if isinstance(attempts, list) else 0
+        if attempts_len >= min_attempts:
+            seen.add(symbol)
+
+    return [symbol.upper() for symbol in symbols if symbol.upper() not in seen]
 
 
 def _build_system_prompt(min_attempts: int) -> str:
@@ -411,7 +444,26 @@ def _run_llm(
             output_text = message.content or ""
             if not output_text.strip():
                 raise RuntimeError("LLM returned empty output")
-            return json.loads(output_text)
+            payload = json.loads(output_text)
+            if task == "max_short_interest" and symbols:
+                unwrapped = _unwrap_response(payload, task)
+                if isinstance(unwrapped, dict):
+                    missing = _missing_symbols(unwrapped, symbols, min_attempts)
+                    if missing:
+                        messages.append(message)
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "You are missing results for: "
+                                    + ", ".join(missing)
+                                    + f". Call the tool for each missing symbol at least {min_attempts} times "
+                                    "near the requested date, then return the full JSON for all symbols."
+                                ),
+                            }
+                        )
+                        continue
+            return payload
 
         messages.append(message)
         for call in tool_calls:
