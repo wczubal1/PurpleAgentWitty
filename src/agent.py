@@ -27,6 +27,9 @@ MAX_TOOL_ROUNDS = 20
 class PurpleRequest(BaseModel):
     task: str | None = None
     client_short_path: str | None = None
+    dataset_group: str | None = None
+    dataset_name: str | None = None
+    question: str | None = None
     args: dict[str, Any] | None = None
     finra_client_id: str | None = None
     finra_client_secret: str | None = None
@@ -61,6 +64,45 @@ def _extract_short_position(
             continue
         return record.get("currentShortPositionQuantity"), record
     return None, None
+
+def _extract_weekly_share(
+    payload: Any,
+    symbol: str,
+    settlement_date: str,
+) -> tuple[Any | None, dict[str, Any] | None]:
+    target_symbol = symbol.upper()
+    for record in _normalize_records(payload):
+        record_symbol = (
+            record.get("issueSymbolIdentifier")
+            or record.get("symbolCode")
+            or record.get("symbol")
+        )
+        if not isinstance(record_symbol, str) or record_symbol.upper() != target_symbol:
+            continue
+        record_date = record.get("weekStartDate") or record.get("summaryStartDate")
+        if not isinstance(record_date, str) or not record_date.startswith(settlement_date):
+            continue
+        return record.get("totalWeeklyShareQuantity"), record
+    return None, None
+
+
+QUESTION_WEEKLY_KEYWORDS = ("weekly", "week", "weeklysummary", "weekly summary")
+QUESTION_SHARE_KEYWORDS = ("share", "shares", "totalweeklysharequantity", "total weekly share")
+QUESTION_SHORT_KEYWORDS = ("short interest", "short position", "current short")
+
+
+def _infer_dataset_from_question(question: str | None) -> tuple[str | None, str | None]:
+    if not question:
+        return None, None
+    lowered = question.lower()
+    if any(key in lowered for key in QUESTION_WEEKLY_KEYWORDS) and any(
+        key in lowered for key in QUESTION_SHARE_KEYWORDS
+    ):
+        return "otcmarket", "weeklySummary"
+    if any(key in lowered for key in QUESTION_SHORT_KEYWORDS):
+        return "otcmarket", "consolidatedShortInterest"
+    return None, None
+
 
 
 def _parse_date(value: str) -> date | None:
@@ -104,6 +146,23 @@ def _unwrap_response(payload: Any, task: str) -> dict[str, Any] | None:
         return nested
     return payload
 
+def _attach_dataset_info(
+    payload: dict[str, Any],
+    task: str,
+    dataset_group: str | None,
+    dataset_name: str | None,
+) -> dict[str, Any]:
+    target = payload
+    nested = payload.get(task)
+    if isinstance(nested, dict):
+        target = nested
+    if dataset_group and "dataset_group" not in target and "datasetGroup" not in target:
+        target["dataset_group"] = dataset_group
+    if dataset_name and "dataset_name" not in target and "datasetName" not in target:
+        target["dataset_name"] = dataset_name
+    return payload
+
+
 
 def _missing_symbols(
     payload: dict[str, Any],
@@ -131,11 +190,14 @@ def _missing_symbols(
 
 def _build_system_prompt(min_attempts: int) -> str:
     return (
-        "You are a purple agent. You must use the provided tool to query FINRA short "
-        "interest data. Data is reported twice per month (15th and month-end). "
+        "You are a purple agent. Decide which FINRA dataset to use based on the question. "
+        "For short interest/short position questions, use consolidatedShortInterest. "
+        "For weekly total shares questions, use weeklySummary and totalWeeklyShareQuantity. "
+        "Use dataset_group/dataset_name from the request when provided. "
+        "Data is reported twice per month (15th and month-end). "
         f"For each symbol, try at least {min_attempts} different settlement dates near the "
         "requested date to find the closest available date with data. "
-        "Return JSON only (no markdown)."
+        "Include dataset_name in your JSON response. Return JSON only (no markdown)."
     )
 
 
@@ -145,12 +207,21 @@ def _build_user_prompt(
     symbols: list[str] | None,
     requested_date: str,
     min_attempts: int,
+    question: str | None,
+    dataset_group: str | None,
+    dataset_name: str | None,
 ) -> str:
     payload: dict[str, Any] = {
         "task": task,
         "requested_settlement_date": requested_date,
         "min_attempts": min_attempts,
     }
+    if question:
+        payload["question"] = question
+    if dataset_group:
+        payload["dataset_group"] = dataset_group
+    if dataset_name:
+        payload["dataset_name"] = dataset_name
     if symbol:
         payload["symbol"] = symbol
     if symbols:
@@ -159,6 +230,7 @@ def _build_user_prompt(
         "max_short_interest": {
             "status": "ok|error",
             "requested_settlement_date": "YYYY-MM-DD",
+            "dataset_name": "consolidatedShortInterest|weeklySummary",
             "best_symbol": "string",
             "best_quantity": "number",
             "results": [
@@ -173,6 +245,7 @@ def _build_user_prompt(
                     ],
                     "chosen_date": "YYYY-MM-DD",
                     "currentShortPositionQuantity": "number|null",
+                    "totalWeeklyShareQuantity": "number|null",
                     "record": "object|null",
                 }
             ],
@@ -182,6 +255,7 @@ def _build_user_prompt(
             "status": "ok|error",
             "symbol": "string",
             "requested_settlement_date": "YYYY-MM-DD",
+            "dataset_name": "consolidatedShortInterest|weeklySummary",
             "chosen_date": "YYYY-MM-DD",
             "attempts": [
                 {
@@ -191,6 +265,7 @@ def _build_user_prompt(
                 }
             ],
             "currentShortPositionQuantity": "number|null",
+            "totalWeeklyShareQuantity": "number|null",
             "record": "object|null",
             "errors": ["string"],
         },
@@ -204,6 +279,8 @@ def _run_client_short(
     symbol: str,
     settlement_date: str,
     issue_name: str | None,
+    dataset_group: str | None,
+    dataset_name: str | None,
     finra_client_id: str | None,
     finra_client_secret: str | None,
     timeout: int | None,
@@ -218,6 +295,10 @@ def _run_client_short(
     ]
     if issue_name:
         cmd.extend(["--issue-name", issue_name])
+    if dataset_group:
+        cmd.extend(["--dataset-group", dataset_group])
+    if dataset_name:
+        cmd.extend(["--dataset-name", dataset_name])
 
     env = os.environ.copy()
     if finra_client_id:
@@ -248,12 +329,21 @@ def _tool_run_client_short(
     finra_client_id: str | None,
     finra_client_secret: str | None,
     timeout: int | None,
+    dataset_group: str | None,
+    dataset_name: str | None,
     symbols_allowed: set[str] | None,
     args: dict[str, Any],
 ) -> dict[str, Any]:
     symbol = str(args.get("symbol", "")).strip().upper()
     settlement_date = str(args.get("settlement_date", "")).strip()
     issue_name = str(args.get("issue_name", "")).strip() or None
+    dataset_group_value = str(args.get("dataset_group") or args.get("datasetGroup") or "").strip() or None
+    dataset_name_value = str(args.get("dataset_name") or args.get("datasetName") or "").strip() or None
+    if not dataset_group_value:
+        dataset_group_value = dataset_group
+    if not dataset_name_value:
+        dataset_name_value = dataset_name
+    is_weekly = bool(dataset_name_value and "weeklysummary" in dataset_name_value.lower())
     if not symbol or not settlement_date:
         return {"error": "symbol and settlement_date are required"}
     if symbols_allowed is not None and symbol not in symbols_allowed:
@@ -268,6 +358,8 @@ def _tool_run_client_short(
                 finra_client_id=finra_client_id,
                 finra_client_secret=finra_client_secret,
                 timeout=timeout,
+                dataset_group=dataset_group_value,
+                dataset_name=dataset_name_value,
                 symbol=symbol,
                 settlement_date=settlement_date,
                 issue_name=issue_name,
@@ -294,10 +386,20 @@ def _tool_run_client_short(
             symbol=symbol,
             settlement_date=settlement_date,
             issue_name=issue_name,
+            dataset_group=dataset_group_value,
+            dataset_name=dataset_name_value,
             finra_client_id=finra_client_id,
             finra_client_secret=finra_client_secret,
             timeout=timeout,
         )
+        if is_weekly:
+            quantity, record = _extract_weekly_share(payload, symbol, settlement_date)
+            return {
+                "symbol": symbol,
+                "settlement_date": settlement_date,
+                "totalWeeklyShareQuantity": quantity,
+                "record": record,
+            }
         quantity, record = _extract_short_position(payload, symbol, settlement_date)
         return {
             "symbol": symbol,
@@ -316,6 +418,8 @@ def _run_mcp_short_interest(
     finra_client_id: str | None,
     finra_client_secret: str | None,
     timeout: int | None,
+    dataset_group: str | None,
+    dataset_name: str | None,
     symbol: str,
     settlement_date: str,
     issue_name: str | None,
@@ -332,6 +436,8 @@ def _run_mcp_short_interest(
         "finra_client_id": finra_client_id,
         "finra_client_secret": finra_client_secret,
         "timeout": timeout,
+        "dataset_group": dataset_group,
+        "dataset_name": dataset_name,
     }
     return _run_async(_call_mcp_tool(params, tool_args))
 
@@ -392,7 +498,10 @@ def _run_llm(
     symbols: list[str] | None,
     requested_date: str,
     min_attempts: int,
+    question: str | None,
     client_short_path: str,
+    dataset_group: str | None,
+    dataset_name: str | None,
     finra_client_id: str | None,
     finra_client_secret: str | None,
     timeout: int | None,
@@ -415,6 +524,8 @@ def _run_llm(
                         "symbol": {"type": "string"},
                         "settlement_date": {"type": "string"},
                         "issue_name": {"type": "string"},
+                        "dataset_group": {"type": "string"},
+                        "dataset_name": {"type": "string"},
                     },
                     "required": ["symbol", "settlement_date"],
                 },
@@ -423,7 +534,16 @@ def _run_llm(
     ]
 
     system_prompt = _build_system_prompt(min_attempts)
-    user_prompt = _build_user_prompt(task, symbol, symbols, requested_date, min_attempts)
+    user_prompt = _build_user_prompt(
+        task,
+        symbol,
+        symbols,
+        requested_date,
+        min_attempts,
+        question,
+        dataset_group,
+        dataset_name,
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -445,6 +565,8 @@ def _run_llm(
             if not output_text.strip():
                 raise RuntimeError("LLM returned empty output")
             payload = json.loads(output_text)
+            if isinstance(payload, dict):
+                payload = _attach_dataset_info(payload, task, dataset_group, dataset_name)
             if task == "max_short_interest" and symbols:
                 unwrapped = _unwrap_response(payload, task)
                 if isinstance(unwrapped, dict):
@@ -482,6 +604,8 @@ def _run_llm(
                     finra_client_id=finra_client_id,
                     finra_client_secret=finra_client_secret,
                     timeout=timeout,
+                    dataset_group=dataset_group,
+                    dataset_name=dataset_name,
                     symbols_allowed=symbols_allowed,
                     args=args,
                 )
@@ -519,6 +643,15 @@ class Agent:
         settlement_date = str(args.get("settlement_date", "")).strip()
         symbols_list = _normalize_symbols(args.get("symbols"))
         requested_date = request.requested_settlement_date or settlement_date
+        question = request.question or args.get("question")
+        dataset_group = request.dataset_group or args.get("dataset_group") or args.get("datasetGroup")
+        dataset_name = request.dataset_name or args.get("dataset_name") or args.get("datasetName")
+        if not dataset_group or not dataset_name:
+            inferred_group, inferred_name = _infer_dataset_from_question(question)
+            if not dataset_group:
+                dataset_group = inferred_group
+            if not dataset_name:
+                dataset_name = inferred_name
 
         allowed_tasks = {None, "fetch_short_interest", "max_short_interest"}
         if request.task not in allowed_tasks:
@@ -569,7 +702,10 @@ class Agent:
                 symbols=symbols_list,
                 requested_date=requested_date,
                 min_attempts=min_attempts,
+                question=question,
                 client_short_path=client_short_path,
+                dataset_group=dataset_group,
+                dataset_name=dataset_name,
                 finra_client_id=request.finra_client_id,
                 finra_client_secret=request.finra_client_secret,
                 timeout=request.timeout,

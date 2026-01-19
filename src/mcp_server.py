@@ -40,12 +40,35 @@ def _extract_short_position(
     return None, None
 
 
+def _extract_weekly_share(
+    payload: Any,
+    symbol: str,
+    settlement_date: str,
+) -> tuple[Any | None, dict[str, Any] | None]:
+    target_symbol = symbol.upper()
+    for record in _normalize_records(payload):
+        record_symbol = (
+            record.get("issueSymbolIdentifier")
+            or record.get("symbolCode")
+            or record.get("symbol")
+        )
+        if not isinstance(record_symbol, str) or record_symbol.upper() != target_symbol:
+            continue
+        record_date = record.get("weekStartDate") or record.get("summaryStartDate")
+        if not isinstance(record_date, str) or not record_date.startswith(settlement_date):
+            continue
+        return record.get("totalWeeklyShareQuantity"), record
+    return None, None
+
+
 def _run_client_short(
     *,
     client_short_path: str,
     symbol: str,
     settlement_date: str,
     issue_name: str | None,
+    dataset_group: str | None,
+    dataset_name: str | None,
     finra_client_id: str | None,
     finra_client_secret: str | None,
     timeout: int | None,
@@ -60,6 +83,10 @@ def _run_client_short(
     ]
     if issue_name:
         cmd.extend(["--issue-name", issue_name])
+    if dataset_group:
+        cmd.extend(["--dataset-group", dataset_group])
+    if dataset_name:
+        cmd.extend(["--dataset-name", dataset_name])
 
     env = os.environ.copy()
     if finra_client_id:
@@ -89,6 +116,8 @@ def finra_short_interest(
     symbol: str,
     settlement_date: str,
     issue_name: str | None = None,
+    dataset_group: str | None = None,
+    dataset_name: str | None = None,
     client_short_path: str | None = None,
     finra_client_id: str | None = None,
     finra_client_secret: str | None = None,
@@ -107,10 +136,21 @@ def finra_short_interest(
         symbol=symbol,
         settlement_date=settlement_date,
         issue_name=issue_name,
+        dataset_group=dataset_group,
+        dataset_name=dataset_name,
         finra_client_id=client_id,
         finra_client_secret=client_secret,
         timeout=timeout,
     )
+    is_weekly = bool(dataset_name and "weeklysummary" in dataset_name.lower())
+    if is_weekly:
+        quantity, record = _extract_weekly_share(payload, symbol, settlement_date)
+        return {
+            "symbol": symbol,
+            "settlement_date": settlement_date,
+            "totalWeeklyShareQuantity": quantity,
+            "record": record,
+        }
     quantity, record = _extract_short_position(payload, symbol, settlement_date)
     return {
         "symbol": symbol,
