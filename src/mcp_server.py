@@ -111,6 +111,49 @@ def _run_client_short(
         raise RuntimeError(f"Invalid JSON from client_short.py: {exc}") from exc
 
 
+def _run_client_short_query(
+    *,
+    client_short_path: str,
+    dataset_group: str | None,
+    dataset_name: str | None,
+    query_params: str | None,
+    finra_client_id: str | None,
+    finra_client_secret: str | None,
+    timeout: int | None,
+) -> Any:
+    cmd = [sys.executable, client_short_path]
+    if dataset_group:
+        cmd.extend(["--dataset-group", dataset_group])
+    if dataset_name:
+        cmd.extend(["--dataset-name", dataset_name])
+    if query_params:
+        cmd.extend(["--query-params", query_params])
+    if timeout:
+        cmd.extend(["--timeout", str(timeout)])
+
+    env = os.environ.copy()
+    if finra_client_id:
+        env["FINRA_CLIENT_ID"] = finra_client_id
+    if finra_client_secret:
+        env["FINRA_CLIENT_SECRET"] = finra_client_secret
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout or 60,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+        raise RuntimeError(f"client_short.py failed: {message}")
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON from client_short.py: {exc}") from exc
+
+
 @mcp.tool()
 def finra_short_interest(
     symbol: str,
@@ -158,6 +201,36 @@ def finra_short_interest(
         "currentShortPositionQuantity": quantity,
         "record": record,
     }
+
+
+@mcp.tool()
+def finra_query_dataset(
+    dataset_group: str | None = None,
+    dataset_name: str | None = None,
+    query_params: str | None = None,
+    client_short_path: str | None = None,
+    finra_client_id: str | None = None,
+    finra_client_secret: str | None = None,
+    timeout: int | None = None,
+) -> dict[str, Any]:
+    path = (
+        client_short_path
+        or os.environ.get("CLIENT_SHORT_PATH")
+        or DEFAULT_CLIENT_SHORT_PATH
+    )
+    client_id = finra_client_id or os.environ.get("FINRA_CLIENT_ID")
+    client_secret = finra_client_secret or os.environ.get("FINRA_CLIENT_SECRET")
+
+    payload = _run_client_short_query(
+        client_short_path=path,
+        dataset_group=dataset_group,
+        dataset_name=dataset_name,
+        query_params=query_params,
+        finra_client_id=client_id,
+        finra_client_secret=client_secret,
+        timeout=timeout,
+    )
+    return {"data": payload}
 
 
 def main() -> None:

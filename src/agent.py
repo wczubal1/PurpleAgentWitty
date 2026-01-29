@@ -86,15 +86,33 @@ def _extract_weekly_share(
     return None, None
 
 
+def _extract_treasury_volume(
+    payload: Any,
+    trade_date: str,
+) -> tuple[Any | None, dict[str, Any] | None]:
+    for record in _normalize_records(payload):
+        record_date = record.get("tradeDate")
+        if not isinstance(record_date, str) or not record_date.startswith(trade_date):
+            continue
+        years = str(record.get("yearsToMaturity") or "").strip()
+        benchmark = str(record.get("benchmark") or "").strip()
+        if years == "<= 2 years" and benchmark.lower() == "on-the-run":
+            return record.get("dealerCustomerVolume"), record
+    return None, None
+
+
 QUESTION_WEEKLY_KEYWORDS = ("weekly", "week", "weeklysummary", "weekly summary")
 QUESTION_SHARE_KEYWORDS = ("share", "shares", "totalweeklysharequantity", "total weekly share")
 QUESTION_SHORT_KEYWORDS = ("short interest", "short position", "current short")
+QUESTION_TREASURY_KEYWORDS = ("treasury", "dealer customer volume", "on-the-run")
 
 
 def _infer_dataset_from_question(question: str | None) -> tuple[str | None, str | None]:
     if not question:
         return None, None
     lowered = question.lower()
+    if any(key in lowered for key in QUESTION_TREASURY_KEYWORDS):
+        return "fixedIncomeMarket", "treasuryDailyAggregates"
     if any(key in lowered for key in QUESTION_WEEKLY_KEYWORDS) and any(
         key in lowered for key in QUESTION_SHARE_KEYWORDS
     ):
@@ -152,14 +170,17 @@ def _attach_dataset_info(
     dataset_group: str | None,
     dataset_name: str | None,
 ) -> dict[str, Any]:
-    target = payload
     nested = payload.get(task)
-    if isinstance(nested, dict):
-        target = nested
-    if dataset_group and "dataset_group" not in target and "datasetGroup" not in target:
-        target["dataset_group"] = dataset_group
-    if dataset_name and "dataset_name" not in target and "datasetName" not in target:
-        target["dataset_name"] = dataset_name
+    if dataset_group:
+        if "dataset_group" not in payload and "datasetGroup" not in payload:
+            payload["dataset_group"] = dataset_group
+        if isinstance(nested, dict) and "dataset_group" not in nested and "datasetGroup" not in nested:
+            nested["dataset_group"] = dataset_group
+    if dataset_name:
+        if "dataset_name" not in payload and "datasetName" not in payload:
+            payload["dataset_name"] = dataset_name
+        if isinstance(nested, dict) and "dataset_name" not in nested and "datasetName" not in nested:
+            nested["dataset_name"] = dataset_name
     return payload
 
 
@@ -193,6 +214,8 @@ def _build_system_prompt(min_attempts: int) -> str:
         "You are a purple agent. Decide which FINRA dataset to use based on the question. "
         "For short interest/short position questions, use consolidatedShortInterest. "
         "For weekly total shares questions, use weeklySummary and totalWeeklyShareQuantity. "
+        "For Treasury dealer customer volume questions, use fixedIncomeMarket/treasuryDailyAggregates "
+        "and return dealerCustomerVolume for <= 2 years, On-the-run. "
         "Use dataset_group/dataset_name from the request when provided. "
         "Data is reported twice per month (15th and month-end). "
         f"For each symbol, try at least {min_attempts} different settlement dates near the "
@@ -216,6 +239,8 @@ def _build_user_prompt(
         "requested_settlement_date": requested_date,
         "min_attempts": min_attempts,
     }
+    if task == "treasury_daily_aggregate":
+        payload["trade_date"] = requested_date
     if question:
         payload["question"] = question
     if dataset_group:
@@ -269,6 +294,16 @@ def _build_user_prompt(
             "record": "object|null",
             "errors": ["string"],
         },
+        "treasury_daily_aggregate": {
+            "status": "ok|error",
+            "tradeDate": "YYYY-MM-DD",
+            "dataset_name": "treasuryDailyAggregates",
+            "yearsToMaturity": "<= 2 years",
+            "benchmark": "On-the-run",
+            "dealerCustomerVolume": "number",
+            "record": "object|null",
+            "errors": ["string"],
+        },
     }
     return json.dumps(payload)
 
@@ -299,6 +334,49 @@ def _run_client_short(
         cmd.extend(["--dataset-group", dataset_group])
     if dataset_name:
         cmd.extend(["--dataset-name", dataset_name])
+
+    env = os.environ.copy()
+    if finra_client_id:
+        env["FINRA_CLIENT_ID"] = finra_client_id
+    if finra_client_secret:
+        env["FINRA_CLIENT_SECRET"] = finra_client_secret
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout or 60,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+        raise RuntimeError(f"client_short.py failed: {message}")
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Invalid JSON from client_short.py: {exc}") from exc
+
+
+def _run_client_short_query(
+    *,
+    client_short_path: str,
+    dataset_group: str | None,
+    dataset_name: str | None,
+    query_params: str | None,
+    finra_client_id: str | None,
+    finra_client_secret: str | None,
+    timeout: int | None,
+) -> Any:
+    cmd = [sys.executable, client_short_path]
+    if dataset_group:
+        cmd.extend(["--dataset-group", dataset_group])
+    if dataset_name:
+        cmd.extend(["--dataset-name", dataset_name])
+    if query_params:
+        cmd.extend(["--query-params", query_params])
+    if timeout:
+        cmd.extend(["--timeout", str(timeout)])
 
     env = os.environ.copy()
     if finra_client_id:
@@ -411,6 +489,77 @@ def _tool_run_client_short(
         return {"symbol": symbol, "settlement_date": settlement_date, "error": str(exc)}
 
 
+def _tool_run_treasury_daily(
+    *,
+    client_short_path: str,
+    finra_client_id: str | None,
+    finra_client_secret: str | None,
+    timeout: int | None,
+    dataset_group: str | None,
+    dataset_name: str | None,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    trade_date = str(
+        args.get("trade_date")
+        or args.get("tradeDate")
+        or args.get("settlement_date")
+        or ""
+    ).strip()
+    dataset_group_value = str(
+        args.get("dataset_group") or args.get("datasetGroup") or ""
+    ).strip() or dataset_group
+    dataset_name_value = str(
+        args.get("dataset_name") or args.get("datasetName") or ""
+    ).strip() or dataset_name
+    if not trade_date:
+        return {"error": "trade_date is required"}
+
+    query_params = f"tradeDate={trade_date}&limit=200"
+    mcp_command = os.environ.get("MCP_SERVER_COMMAND")
+    try:
+        if mcp_command:
+            payload = _run_mcp_query_dataset(
+                command=mcp_command,
+                client_short_path=client_short_path,
+                finra_client_id=finra_client_id,
+                finra_client_secret=finra_client_secret,
+                timeout=timeout,
+                dataset_group=dataset_group_value,
+                dataset_name=dataset_name_value,
+                query_params=query_params,
+            )
+            if isinstance(payload, dict) and "data" in payload:
+                payload = payload["data"]
+        else:
+            payload = _run_client_short_query(
+                client_short_path=client_short_path,
+                dataset_group=dataset_group_value,
+                dataset_name=dataset_name_value,
+                query_params=query_params,
+                finra_client_id=finra_client_id,
+                finra_client_secret=finra_client_secret,
+                timeout=timeout,
+            )
+        volume, record = _extract_treasury_volume(payload, trade_date)
+        if volume is None:
+            return {
+                "tradeDate": trade_date,
+                "dataset_group": dataset_group_value,
+                "dataset_name": dataset_name_value,
+                "error": "No matching treasury record found",
+                "record": record,
+            }
+        return {
+            "tradeDate": trade_date,
+            "dealerCustomerVolume": volume,
+            "record": record,
+            "dataset_group": dataset_group_value,
+            "dataset_name": dataset_name_value,
+        }
+    except Exception as exc:
+        return {"tradeDate": trade_date, "error": str(exc)}
+
+
 def _run_mcp_short_interest(
     *,
     command: str,
@@ -442,20 +591,52 @@ def _run_mcp_short_interest(
     return _run_async(_call_mcp_tool(params, tool_args))
 
 
+def _run_mcp_query_dataset(
+    *,
+    command: str,
+    client_short_path: str,
+    finra_client_id: str | None,
+    finra_client_secret: str | None,
+    timeout: int | None,
+    dataset_group: str | None,
+    dataset_name: str | None,
+    query_params: str,
+) -> dict[str, Any]:
+    parts = shlex.split(command)
+    if not parts:
+        raise RuntimeError("MCP_SERVER_COMMAND is empty")
+    params = StdioServerParameters(command=parts[0], args=parts[1:])
+    tool_args = {
+        "client_short_path": client_short_path,
+        "finra_client_id": finra_client_id,
+        "finra_client_secret": finra_client_secret,
+        "timeout": timeout,
+        "dataset_group": dataset_group,
+        "dataset_name": dataset_name,
+        "query_params": query_params,
+    }
+    return _run_async(
+        _call_mcp_tool(params, tool_args, tool_name="finra_query_dataset")
+    )
+
+
 async def _call_mcp_tool(
     params: StdioServerParameters,
     tool_args: dict[str, Any],
+    tool_name: str = "finra_short_interest",
 ) -> dict[str, Any]:
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            result = await session.call_tool("finra_short_interest", tool_args)
+            result = await session.call_tool(tool_name, tool_args)
             return _coerce_mcp_result(result)
 
 
 def _coerce_mcp_result(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
         return result
+    if isinstance(result, list):
+        return {"data": result}
     content = getattr(result, "content", None)
     if isinstance(content, list) and content:
         first = content[0]
@@ -530,7 +711,23 @@ def _run_llm(
                     "required": ["symbol", "settlement_date"],
                 },
             },
-        }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_treasury_daily",
+                "description": "Query treasuryDailyAggregates and return dealerCustomerVolume.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "trade_date": {"type": "string"},
+                        "dataset_group": {"type": "string"},
+                        "dataset_name": {"type": "string"},
+                    },
+                    "required": ["trade_date"],
+                },
+            },
+        },
     ]
 
     system_prompt = _build_system_prompt(min_attempts)
@@ -589,16 +786,12 @@ def _run_llm(
 
         messages.append(message)
         for call in tool_calls:
-            if call.function.name != "run_client_short":
-                tool_payload = {
-                    "error": f"Unsupported tool: {call.function.name}"
-                }
-            else:
-                arguments = call.function.arguments or "{}"
-                try:
-                    args = json.loads(arguments)
-                except json.JSONDecodeError:
-                    args = {}
+            arguments = call.function.arguments or "{}"
+            try:
+                args = json.loads(arguments)
+            except json.JSONDecodeError:
+                args = {}
+            if call.function.name == "run_client_short":
                 tool_payload = _tool_run_client_short(
                     client_short_path=client_short_path,
                     finra_client_id=finra_client_id,
@@ -609,6 +802,18 @@ def _run_llm(
                     symbols_allowed=symbols_allowed,
                     args=args,
                 )
+            elif call.function.name == "run_treasury_daily":
+                tool_payload = _tool_run_treasury_daily(
+                    client_short_path=client_short_path,
+                    finra_client_id=finra_client_id,
+                    finra_client_secret=finra_client_secret,
+                    timeout=timeout,
+                    dataset_group=dataset_group,
+                    dataset_name=dataset_name,
+                    args=args,
+                )
+            else:
+                tool_payload = {"error": f"Unsupported tool: {call.function.name}"}
             messages.append(
                 {
                     "role": "tool",
@@ -641,8 +846,10 @@ class Agent:
         args = request.args or {}
         symbol = str(args.get("symbol", "")).strip() or None
         settlement_date = str(args.get("settlement_date", "")).strip()
+        trade_date = str(
+            args.get("trade_date") or args.get("tradeDate") or settlement_date or ""
+        ).strip()
         symbols_list = _normalize_symbols(args.get("symbols"))
-        requested_date = request.requested_settlement_date or settlement_date
         question = request.question or args.get("question")
         dataset_group = request.dataset_group or args.get("dataset_group") or args.get("datasetGroup")
         dataset_name = request.dataset_name or args.get("dataset_name") or args.get("datasetName")
@@ -652,8 +859,12 @@ class Agent:
                 dataset_group = inferred_group
             if not dataset_name:
                 dataset_name = inferred_name
+        is_treasury = bool(dataset_name and "treasurydailyaggregates" in dataset_name.lower())
+        requested_date = request.requested_settlement_date or (
+            trade_date if is_treasury else settlement_date
+        )
 
-        allowed_tasks = {None, "fetch_short_interest", "max_short_interest"}
+        allowed_tasks = {None, "fetch_short_interest", "max_short_interest", "treasury_daily_aggregate"}
         if request.task not in allowed_tasks:
             response["error"] = f"Unsupported task: {request.task}"
             await updater.add_artifact(
@@ -669,9 +880,18 @@ class Agent:
             )
             return
 
-        task_name = request.task or ("max_short_interest" if symbols_list else "fetch_short_interest")
+        task_name = request.task or (
+            "treasury_daily_aggregate" if is_treasury else ("max_short_interest" if symbols_list else "fetch_short_interest")
+        )
 
-        if task_name == "max_short_interest":
+        if task_name == "treasury_daily_aggregate":
+            if not trade_date:
+                response["error"] = "Missing required args: trade_date"
+                await updater.add_artifact(
+                    parts=[Part(root=DataPart(data=response))], name="Result"
+                )
+                return
+        elif task_name == "max_short_interest":
             if not symbols_list or not settlement_date:
                 response["error"] = "Missing required args: symbols and settlement_date"
                 await updater.add_artifact(
@@ -686,7 +906,14 @@ class Agent:
                 )
                 return
 
-        if not _parse_date(settlement_date):
+        if task_name == "treasury_daily_aggregate":
+            if not _parse_date(trade_date):
+                response["error"] = "trade_date must be in YYYY-MM-DD format"
+                await updater.add_artifact(
+                    parts=[Part(root=DataPart(data=response))], name="Result"
+                )
+                return
+        elif not _parse_date(settlement_date):
             response["error"] = "settlement_date must be in YYYY-MM-DD format"
             await updater.add_artifact(
                 parts=[Part(root=DataPart(data=response))], name="Result"
