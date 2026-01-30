@@ -1,8 +1,9 @@
 from typing import Any
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import asyncio
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -89,14 +90,16 @@ def _extract_weekly_share(
 def _extract_treasury_volume(
     payload: Any,
     trade_date: str,
+    years_to_maturity: str,
+    benchmark: str,
 ) -> tuple[Any | None, dict[str, Any] | None]:
     for record in _normalize_records(payload):
         record_date = record.get("tradeDate")
         if not isinstance(record_date, str) or not record_date.startswith(trade_date):
             continue
         years = str(record.get("yearsToMaturity") or "").strip()
-        benchmark = str(record.get("benchmark") or "").strip()
-        if years == "<= 2 years" and benchmark.lower() == "on-the-run":
+        record_benchmark = str(record.get("benchmark") or "").strip()
+        if years == years_to_maturity and record_benchmark.lower() == benchmark.lower():
             return record.get("dealerCustomerVolume"), record
     return None, None
 
@@ -105,6 +108,13 @@ QUESTION_WEEKLY_KEYWORDS = ("weekly", "week", "weeklysummary", "weekly summary")
 QUESTION_SHARE_KEYWORDS = ("share", "shares", "totalweeklysharequantity", "total weekly share")
 QUESTION_SHORT_KEYWORDS = ("short interest", "short position", "current short")
 QUESTION_TREASURY_KEYWORDS = ("treasury", "dealer customer volume", "on-the-run")
+TREASURY_UPPER_BOUND_BUCKETS = {
+    2: "<= 2 years",
+    3: "> 2 years and <= 3 years",
+    5: "> 3 years and <= 5 years",
+    7: "> 5 years and <= 7 years",
+    10: "> 7 years and <= 10 years",
+}
 
 
 def _infer_dataset_from_question(question: str | None) -> tuple[str | None, str | None]:
@@ -121,6 +131,57 @@ def _infer_dataset_from_question(question: str | None) -> tuple[str | None, str 
         return "otcmarket", "consolidatedShortInterest"
     return None, None
 
+
+def _is_treasury_max_question(question: str | None) -> bool:
+    if not question:
+        return False
+    lowered = question.lower()
+    return ("highest" in lowered or "max" in lowered) and "dealer customer volume" in lowered
+
+
+def _has_treasury_bucket(question: str | None) -> bool:
+    if not question:
+        return False
+    lowered = question.lower()
+    if re.search(r">\\s*\\d+\\s*years\\s*and\\s*<=\\s*\\d+\\s*years", lowered):
+        return True
+    if re.search(r"(?:<=|up to)\\s*\\d+\\s*years", lowered):
+        return True
+    return False
+
+
+def _parse_treasury_bucket(question: str | None) -> tuple[str, str]:
+    if not question:
+        return "<= 2 years", "On-the-run"
+    lowered = question.lower()
+    benchmark = "On-the-run"
+    if "off-the-run" in lowered or "off the run" in lowered:
+        benchmark = "Off-the-run"
+    elif "on-the-run" in lowered or "on the run" in lowered:
+        benchmark = "On-the-run"
+
+    explicit = re.search(r">\\s*\\d+\\s*years\\s*and\\s*<=\\s*\\d+\\s*years", lowered)
+    if explicit:
+        return explicit.group(0).replace("  ", " "), benchmark
+    bound_match = re.search(r"(?:<=|up to)\\s*(\\d+)\\s*years", lowered)
+    if bound_match:
+        bound = int(bound_match.group(1))
+        bucket = TREASURY_UPPER_BOUND_BUCKETS.get(bound)
+        if bucket:
+            return bucket, benchmark
+        return f"<= {bound} years", benchmark
+    return "<= 2 years", benchmark
+
+
+def _shift_year(value: str, years: int) -> str | None:
+    parsed = _parse_date(value)
+    if not parsed:
+        return None
+    try:
+        return parsed.replace(year=parsed.year + years).strftime("%Y-%m-%d")
+    except ValueError:
+        adjusted = parsed - timedelta(days=1)
+        return adjusted.replace(year=adjusted.year + years).strftime("%Y-%m-%d")
 
 
 def _parse_date(value: str) -> date | None:
@@ -142,6 +203,16 @@ def _coerce_number(value: Any) -> float | None:
         return float(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "t"}
+    return False
 
 
 def _normalize_symbols(value: Any) -> list[str] | None:
@@ -215,7 +286,11 @@ def _build_system_prompt(min_attempts: int) -> str:
         "For short interest/short position questions, use consolidatedShortInterest. "
         "For weekly total shares questions, use weeklySummary and totalWeeklyShareQuantity. "
         "For Treasury dealer customer volume questions, use fixedIncomeMarket/treasuryDailyAggregates "
-        "and return dealerCustomerVolume for <= 2 years, On-the-run. "
+        "and return dealerCustomerVolume for the requested maturity bucket and benchmark "
+        "(On-the-run/Off-the-run). If the question asks for the highest dealer customer volume, "
+        "compare matching rows and return the maturity bucket with the max value. "
+        "If a trade date falls on a weekend/holiday, use the closest available tradeDate and "
+        "include attempts in the response. "
         "Use dataset_group/dataset_name from the request when provided. "
         "Data is reported twice per month (15th and month-end). "
         f"For each symbol, try at least {min_attempts} different settlement dates near the "
@@ -241,6 +316,11 @@ def _build_user_prompt(
     }
     if task == "treasury_daily_aggregate":
         payload["trade_date"] = requested_date
+        expected_years, expected_benchmark = _parse_treasury_bucket(question)
+        payload["expected_years_to_maturity"] = expected_years
+        payload["expected_benchmark"] = expected_benchmark
+        if _is_treasury_delta_question(question):
+            payload["previous_trade_date"] = _shift_year(requested_date, -1) or ""
     if question:
         payload["question"] = question
     if dataset_group:
@@ -251,6 +331,12 @@ def _build_user_prompt(
         payload["symbol"] = symbol
     if symbols:
         payload["symbols"] = symbols
+    is_treasury_delta = (
+        _is_treasury_delta_question(question) if task == "treasury_daily_aggregate" else False
+    )
+    is_treasury_max = (
+        _is_treasury_max_question(question) if task == "treasury_daily_aggregate" else False
+    )
     payload["response_format"] = {
         "max_short_interest": {
             "status": "ok|error",
@@ -298,13 +384,41 @@ def _build_user_prompt(
             "status": "ok|error",
             "tradeDate": "YYYY-MM-DD",
             "dataset_name": "treasuryDailyAggregates",
-            "yearsToMaturity": "<= 2 years",
-            "benchmark": "On-the-run",
-            "dealerCustomerVolume": "number",
+            "benchmark": "On-the-run|Off-the-run",
             "record": "object|null",
             "errors": ["string"],
         },
     }
+    if is_treasury_delta:
+        payload["response_format"]["treasury_daily_aggregate"].update(
+            {
+                "previous_trade_date": "YYYY-MM-DD",
+                "best_years_to_maturity": "yearsToMaturity bucket string",
+                "best_dealer_customer_volume_delta": "number",
+                "record_current": "object|null",
+                "record_previous": "object|null",
+                "candidates_current": "array (rows considered)",
+                "candidates_previous": "array (rows considered)",
+                "attempts": "object (current/previous attempts)",
+            }
+        )
+    elif is_treasury_max:
+        payload["response_format"]["treasury_daily_aggregate"].update(
+            {
+                "best_years_to_maturity": "yearsToMaturity bucket string",
+                "best_dealer_customer_volume": "number",
+                "candidates": "array (rows considered)",
+                "attempts": "array (date attempts)",
+            }
+        )
+    else:
+        payload["response_format"]["treasury_daily_aggregate"].update(
+            {
+                "yearsToMaturity": "<= 2 years",
+                "dealerCustomerVolume": "number",
+                "attempts": "array (date attempts)",
+            }
+        )
     return json.dumps(payload)
 
 
@@ -505,6 +619,23 @@ def _tool_run_treasury_daily(
         or args.get("settlement_date")
         or ""
     ).strip()
+    years_to_maturity = str(
+        args.get("years_to_maturity")
+        or args.get("yearsToMaturity")
+        or args.get("expected_years_to_maturity")
+        or args.get("expectedYearsToMaturity")
+        or ""
+    ).strip()
+    benchmark = str(
+        args.get("benchmark")
+        or args.get("expected_benchmark")
+        or args.get("expectedBenchmark")
+        or ""
+    ).strip()
+    select_max = _coerce_bool(args.get("select_max") or args.get("selectMax"))
+    bucket_explicit = _coerce_bool(
+        args.get("bucket_explicit") or args.get("bucketExplicit")
+    )
     dataset_group_value = str(
         args.get("dataset_group") or args.get("datasetGroup") or ""
     ).strip() or dataset_group
@@ -514,9 +645,29 @@ def _tool_run_treasury_daily(
     if not trade_date:
         return {"error": "trade_date is required"}
 
-    query_params = f"tradeDate={trade_date}&limit=200"
-    mcp_command = os.environ.get("MCP_SERVER_COMMAND")
+    search_days = args.get("date_search_days") or args.get("dateSearchDays") or 7
     try:
+        search_days = int(search_days)
+    except (TypeError, ValueError):
+        search_days = 7
+
+    def _iter_search_dates(base: str, days: int) -> list[str]:
+        parsed = _parse_date(base)
+        if not parsed:
+            return [base]
+        offsets: list[int] = [0]
+        for i in range(1, days + 1):
+            offsets.append(-i)
+            offsets.append(i)
+        dates = []
+        for offset in offsets:
+            candidate = parsed + timedelta(days=offset)
+            dates.append(candidate.strftime("%Y-%m-%d"))
+        return dates
+
+    def _fetch_payload(date_value: str) -> Any:
+        query_params = f"tradeDate={date_value}&limit=200"
+        mcp_command = os.environ.get("MCP_SERVER_COMMAND")
         if mcp_command:
             payload = _run_mcp_query_dataset(
                 command=mcp_command,
@@ -530,29 +681,195 @@ def _tool_run_treasury_daily(
             )
             if isinstance(payload, dict) and "data" in payload:
                 payload = payload["data"]
-        else:
-            payload = _run_client_short_query(
-                client_short_path=client_short_path,
-                dataset_group=dataset_group_value,
-                dataset_name=dataset_name_value,
-                query_params=query_params,
-                finra_client_id=finra_client_id,
-                finra_client_secret=finra_client_secret,
-                timeout=timeout,
+            return payload
+        return _run_client_short_query(
+            client_short_path=client_short_path,
+            dataset_group=dataset_group_value,
+            dataset_name=dataset_name_value,
+            query_params=query_params,
+            finra_client_id=finra_client_id,
+            finra_client_secret=finra_client_secret,
+            timeout=timeout,
+        )
+
+    def _search_candidates(
+        base_date: str,
+        *,
+        require_bucket: bool,
+    ) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]]]:
+        attempts: list[dict[str, Any]] = []
+        for candidate_date in _iter_search_dates(base_date, search_days):
+            payload = _fetch_payload(candidate_date)
+            records = []
+            for record in _normalize_records(payload):
+                record_date = record.get("tradeDate")
+                if not isinstance(record_date, str) or not record_date.startswith(
+                    candidate_date
+                ):
+                    continue
+                record_benchmark = str(record.get("benchmark") or "").strip()
+                if record_benchmark.lower() != (benchmark or "On-the-run").lower():
+                    continue
+                record_years = str(record.get("yearsToMaturity") or "").strip()
+                if require_bucket and years_to_maturity and record_years != years_to_maturity:
+                    continue
+                records.append(record)
+            attempts.append({"tradeDate": candidate_date, "has_data": bool(records)})
+            if records:
+                return candidate_date, records, attempts
+        return None, [], attempts
+
+    try:
+        if select_max and _coerce_bool(args.get("compare_previous")):
+            previous_date = str(
+                args.get("previous_trade_date")
+                or args.get("previousTradeDate")
+                or ""
+            ).strip()
+            if not previous_date:
+                previous_date = _shift_year(trade_date, -1) or ""
+            current_date, candidates_current, attempts_current = _search_candidates(
+                trade_date, require_bucket=bucket_explicit
             )
-        volume, record = _extract_treasury_volume(payload, trade_date)
-        if volume is None:
+            previous_date_resolved, candidates_previous, attempts_previous = (
+                _search_candidates(previous_date, require_bucket=bucket_explicit)
+            )
+            if not current_date or not previous_date_resolved:
+                return {
+                    "tradeDate": trade_date,
+                    "previous_trade_date": previous_date,
+                    "benchmark": benchmark or "On-the-run",
+                    "dataset_group": dataset_group_value,
+                    "dataset_name": dataset_name_value,
+                    "error": "No matching treasury records found",
+                    "attempts": {
+                        "current": attempts_current,
+                        "previous": attempts_previous,
+                    },
+                }
+
+            def _bucket_map(records: list[dict[str, Any]]) -> dict[str, float]:
+                buckets: dict[str, float] = {}
+                for record in records:
+                    record_years = str(record.get("yearsToMaturity") or "").strip()
+                    volume = _coerce_number(record.get("dealerCustomerVolume"))
+                    if volume is None:
+                        continue
+                    current = buckets.get(record_years)
+                    if current is None or volume > current:
+                        buckets[record_years] = volume
+                return buckets
+
+            current_map = _bucket_map(candidates_current)
+            previous_map = _bucket_map(candidates_previous)
+            shared = [key for key in current_map if key in previous_map]
+            if not shared:
+                return {
+                    "tradeDate": current_date,
+                    "previous_trade_date": previous_date_resolved,
+                    "benchmark": benchmark or "On-the-run",
+                    "dataset_group": dataset_group_value,
+                    "dataset_name": dataset_name_value,
+                    "error": "No overlapping maturity buckets found",
+                    "candidates_current": candidates_current,
+                    "candidates_previous": candidates_previous,
+                    "attempts": {
+                        "current": attempts_current,
+                        "previous": attempts_previous,
+                    },
+                }
+
+            best_years = max(shared, key=lambda key: current_map[key] - previous_map[key])
+            best_delta = current_map[best_years] - previous_map[best_years]
+            record_current = next(
+                (item for item in candidates_current if str(item.get("yearsToMaturity") or "").strip() == best_years),
+                None,
+            )
+            record_previous = next(
+                (item for item in candidates_previous if str(item.get("yearsToMaturity") or "").strip() == best_years),
+                None,
+            )
+            return {
+                "tradeDate": current_date,
+                "previous_trade_date": previous_date_resolved,
+                "benchmark": benchmark or "On-the-run",
+                "best_years_to_maturity": best_years,
+                "best_dealer_customer_volume_delta": best_delta,
+                "record_current": record_current,
+                "record_previous": record_previous,
+                "candidates_current": candidates_current,
+                "candidates_previous": candidates_previous,
+                "attempts": {
+                    "current": attempts_current,
+                    "previous": attempts_previous,
+                },
+                "dataset_group": dataset_group_value,
+                "dataset_name": dataset_name_value,
+            }
+
+        if select_max:
+            resolved_date, candidates, attempts = _search_candidates(
+                trade_date, require_bucket=bucket_explicit
+            )
+            if not resolved_date:
+                return {
+                    "tradeDate": trade_date,
+                    "dataset_group": dataset_group_value,
+                    "dataset_name": dataset_name_value,
+                    "error": "No matching treasury records found",
+                    "candidates": [],
+                    "attempts": attempts,
+                }
+            best_record = max(
+                candidates,
+                key=lambda item: _coerce_number(item.get("dealerCustomerVolume"))
+                or float("-inf"),
+            )
+            best_volume = _coerce_number(best_record.get("dealerCustomerVolume"))
+            best_years = str(best_record.get("yearsToMaturity") or "").strip()
+            if best_volume is None:
+                return {
+                    "tradeDate": resolved_date,
+                    "benchmark": benchmark or "On-the-run",
+                    "dataset_group": dataset_group_value,
+                    "dataset_name": dataset_name_value,
+                    "error": "No dealerCustomerVolume values found",
+                    "candidates": candidates,
+                    "attempts": attempts,
+                }
+            return {
+                "tradeDate": resolved_date,
+                "benchmark": benchmark or "On-the-run",
+                "best_years_to_maturity": best_years,
+                "best_dealer_customer_volume": best_volume,
+                "record": best_record,
+                "candidates": candidates,
+                "attempts": attempts,
+                "dataset_group": dataset_group_value,
+                "dataset_name": dataset_name_value,
+            }
+
+        resolved_date, candidates, attempts = _search_candidates(
+            trade_date, require_bucket=True
+        )
+        if not resolved_date or not candidates:
             return {
                 "tradeDate": trade_date,
                 "dataset_group": dataset_group_value,
                 "dataset_name": dataset_name_value,
                 "error": "No matching treasury record found",
-                "record": record,
+                "record": None,
+                "attempts": attempts,
             }
+        record = candidates[0]
+        volume = record.get("dealerCustomerVolume")
         return {
-            "tradeDate": trade_date,
+            "tradeDate": resolved_date,
             "dealerCustomerVolume": volume,
+            "yearsToMaturity": years_to_maturity or "<= 2 years",
+            "benchmark": benchmark or "On-the-run",
             "record": record,
+            "attempts": attempts,
             "dataset_group": dataset_group_value,
             "dataset_name": dataset_name_value,
         }
@@ -723,6 +1040,10 @@ def _run_llm(
                         "trade_date": {"type": "string"},
                         "dataset_group": {"type": "string"},
                         "dataset_name": {"type": "string"},
+                        "years_to_maturity": {"type": "string"},
+                        "benchmark": {"type": "string"},
+                        "select_max": {"type": "boolean"},
+                        "bucket_explicit": {"type": "boolean"},
                     },
                     "required": ["trade_date"],
                 },
@@ -803,6 +1124,21 @@ def _run_llm(
                     args=args,
                 )
             elif call.function.name == "run_treasury_daily":
+                is_max = _is_treasury_max_question(question)
+                is_delta = _is_treasury_delta_question(question)
+                bucket_explicit = _has_treasury_bucket(question)
+                args.setdefault("select_max", is_max or is_delta)
+                if is_delta:
+                    args.setdefault("compare_previous", True)
+                    args.setdefault("previous_trade_date", _shift_year(requested_date, -1) or "")
+                args.setdefault("bucket_explicit", bucket_explicit)
+                expected_years, expected_benchmark = _parse_treasury_bucket(question)
+                if "benchmark" not in args:
+                    args["benchmark"] = expected_benchmark
+                if (not is_max and not is_delta or bucket_explicit) and (
+                    "years_to_maturity" not in args and "yearsToMaturity" not in args
+                ):
+                    args["years_to_maturity"] = expected_years
                 tool_payload = _tool_run_treasury_daily(
                     client_short_path=client_short_path,
                     finra_client_id=finra_client_id,
