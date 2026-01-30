@@ -139,6 +139,19 @@ def _is_treasury_max_question(question: str | None) -> bool:
     return ("highest" in lowered or "max" in lowered) and "dealer customer volume" in lowered
 
 
+def _is_treasury_delta_question(question: str | None) -> bool:
+    if not question:
+        return False
+    lowered = question.lower()
+    return "dealer customer volume" in lowered and (
+        "last year" in lowered
+        or "over the last year" in lowered
+        or "year over year" in lowered
+        or "year-over-year" in lowered
+        or "yoy" in lowered
+    )
+
+
 def _has_treasury_bucket(question: str | None) -> bool:
     if not question:
         return False
